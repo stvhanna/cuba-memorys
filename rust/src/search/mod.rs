@@ -1,5 +1,10 @@
-//! Search module — hybrid search with RRF, caching, and confidence.
-
+pub mod bm25;
+pub mod budget;
 pub mod cache;
+pub mod calibrate;
 pub mod confidence;
+pub mod mmr;
+pub mod ood;
+pub mod ood_cache;
+pub mod rerank;
 pub mod rrf;

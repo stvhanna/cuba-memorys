@@ -1,5 +1,8 @@
-//! Graph module — PageRank, community detection, betweenness centrality.
-
+pub mod activation;
+pub mod autolink;
 pub mod centrality;
+pub mod closeness;
 pub mod community;
+pub mod energy;
+pub mod kcore;
 pub mod pagerank;

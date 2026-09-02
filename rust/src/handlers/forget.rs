@@ -1,13 +1,3 @@
-//! Handler: cuba_forget — GDPR Right to Erasure (ARCO).
-//!
-//! Performs cascading hard-delete across ALL tables for a given entity,
-//! including brain_errors and brain_sessions which are NOT covered by
-//! FK ON DELETE CASCADE (they reference entities by name, not FK).
-//!
-//! POST-AUDIT FIX: Gemini audit identified COMP-001 (GDPR non-compliance)
-//! because cuba_alma(delete) only cascades via FK to observations + relations,
-//! leaving orphaned references in errors/sessions.
-
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -36,44 +26,46 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         );
     }
 
-    // Use a transaction for atomicity
+    let project_id = crate::project::current_project_id(pool).await?;
+
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
-    // 1. Delete errors that mention this entity (by name in context or message)
     let errors_deleted: (i64,) = sqlx::query_as(
         "WITH deleted AS (
             DELETE FROM brain_errors
-            WHERE error_message ILIKE '%' || $1 || '%'
-               OR context::text ILIKE '%' || $1 || '%'
+            WHERE POSITION(LOWER($1) IN LOWER(error_message)) > 0
+               OR POSITION(LOWER($1) IN LOWER(context::text)) > 0
             RETURNING 1
-        ) SELECT COUNT(*) FROM deleted"
+        ) SELECT COUNT(*) FROM deleted",
     )
     .bind(entity_name)
     .fetch_one(&mut *tx)
     .await
     .context("failed to delete errors")?;
 
-    // 2. Delete sessions that mention this entity in goals or summary
     let sessions_deleted: (i64,) = sqlx::query_as(
         "WITH deleted AS (
             DELETE FROM brain_sessions
-            WHERE goals::text ILIKE '%' || $1 || '%'
-               OR session_name ILIKE '%' || $1 || '%'
-               OR summary ILIKE '%' || $1 || '%'
+            WHERE POSITION(LOWER($1) IN LOWER(goals::text)) > 0
+               OR POSITION(LOWER($1) IN LOWER(session_name)) > 0
+               OR POSITION(LOWER($1) IN LOWER(COALESCE(summary, ''))) > 0
             RETURNING 1
-        ) SELECT COUNT(*) FROM deleted"
+        ) SELECT COUNT(*) FROM deleted",
     )
     .bind(entity_name)
     .fetch_one(&mut *tx)
     .await
     .context("failed to delete sessions")?;
 
-    // 3. Delete the entity itself (FK CASCADE handles observations + relations)
-    let entity_deleted = sqlx::query("DELETE FROM brain_entities WHERE name = $1")
-        .bind(entity_name)
-        .execute(&mut *tx)
-        .await
-        .context("failed to delete entity")?;
+    let entity_deleted = sqlx::query(
+        "DELETE FROM brain_entities WHERE name = $1
+         AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+    )
+    .bind(entity_name)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to delete entity")?;
 
     tx.commit().await.context("failed to commit transaction")?;
 
@@ -93,6 +85,7 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
         "entity_deleted": entity_found,
         "cascaded": {
             "observations": "via FK CASCADE",
+            "episodes": "via FK CASCADE",
             "relations": "via FK CASCADE",
             "errors_purged": errors_deleted.0,
             "sessions_purged": sessions_deleted.0

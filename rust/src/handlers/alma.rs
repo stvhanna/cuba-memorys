@@ -1,11 +1,5 @@
-//! Handler: cuba_alma — Entity CRUD.
-//!
-//! FIX B3: create returns explicit "already_existed" flag instead of silent upsert.
-//! V10: Upsert detection — AI knows if entity was created or re-found.
-//! Hebbian: get/update auto-boost entity + neighbor importance.
-
-use crate::constants::VALID_ENTITY_TYPES;
 use crate::cognitive::{dual_strength, hebbian};
+use crate::constants::VALID_ENTITY_TYPES;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -23,7 +17,6 @@ pub async fn handle(pool: &PgPool, args: Value) -> Result<Value> {
     }
 }
 
-/// Create entity — FIX B3: explicit "already_existed" detection.
 async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
     if name.is_empty() || name.len() > 200 {
         anyhow::bail!("Entity name must be 1-200 characters");
@@ -38,7 +31,6 @@ async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
         anyhow::bail!("Invalid entity_type: {entity_type}");
     }
 
-    // FIX B3: Check existence FIRST, then insert if needed (no silent upsert)
     let existing: Option<(uuid::Uuid, String, String, f64, i32)> = sqlx::query_as(
         "SELECT id, name, entity_type, importance, access_count FROM brain_entities WHERE name = $1"
     )
@@ -47,10 +39,8 @@ async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
     .await?;
 
     if let Some((id, existing_name, existing_type, importance, access_count)) = existing {
-        // V10: Return explicit flag that entity already existed
         tracing::info!(entity = %name, "entity already exists (V10 detection)");
 
-        // Hebbian boost on re-access
         boost_entity_importance(pool, id).await?;
 
         return Ok(serde_json::json!({
@@ -67,12 +57,14 @@ async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
         }));
     }
 
-    // Actually create
+    let project_id = crate::project::current_project_id(pool).await?;
+
     let row: (uuid::Uuid,) = sqlx::query_as(
-        "INSERT INTO brain_entities (name, entity_type) VALUES ($1, $2) RETURNING id"
+        "INSERT INTO brain_entities (name, entity_type, project_id) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
     .bind(entity_type)
+    .bind(project_id)
     .fetch_one(pool)
     .await
     .context("failed to create entity")?;
@@ -91,24 +83,19 @@ async fn create(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
     }))
 }
 
-/// Update entity name.
 async fn update(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
-    let new_name = args
-        .get("new_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let new_name = args.get("new_name").and_then(|v| v.as_str()).unwrap_or("");
 
     if new_name.is_empty() || new_name.len() > 200 {
         anyhow::bail!("new_name must be 1-200 characters");
     }
 
-    let result = sqlx::query(
-        "UPDATE brain_entities SET name = $1, updated_at = NOW() WHERE name = $2"
-    )
-    .bind(new_name)
-    .bind(name)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE brain_entities SET name = $1, updated_at = NOW() WHERE name = $2")
+            .bind(new_name)
+            .bind(name)
+            .execute(pool)
+            .await?;
 
     if result.rows_affected() == 0 {
         anyhow::bail!("Entity '{name}' not found");
@@ -123,15 +110,21 @@ async fn update(pool: &PgPool, name: &str, args: &Value) -> Result<Value> {
     }))
 }
 
-/// Delete entity (cascades to observations and relations).
 async fn delete(pool: &PgPool, name: &str) -> Result<Value> {
-    let result = sqlx::query("DELETE FROM brain_entities WHERE name = $1")
-        .bind(name)
-        .execute(pool)
-        .await?;
+    let project_id = crate::project::current_project_id(pool).await?;
+
+    let result = sqlx::query(
+        "DELETE FROM brain_entities
+         WHERE name = $1
+           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
+    )
+    .bind(name)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
 
     if result.rows_affected() == 0 {
-        anyhow::bail!("Entity '{name}' not found");
+        anyhow::bail!("Entity '{name}' not found (within current project scope)");
     }
 
     tracing::info!(entity = %name, "entity deleted (cascaded)");
@@ -143,14 +136,17 @@ async fn delete(pool: &PgPool, name: &str) -> Result<Value> {
     }))
 }
 
-/// Get entity with observations — FIX B1: fresh data with FOR UPDATE.
 async fn get(pool: &PgPool, name: &str) -> Result<Value> {
-    // Get entity (with FOR UPDATE to prevent stale reads — FIX B1 partial)
+    let project_id = crate::project::current_project_id(pool).await?;
+
     let entity: Option<(uuid::Uuid, String, String, f64, i32)> = sqlx::query_as(
         "SELECT id, name, entity_type, importance, access_count
-         FROM brain_entities WHERE name = $1"
+         FROM brain_entities
+         WHERE name = $1
+           AND ($2::uuid IS NULL OR project_id = $2 OR project_id IS NULL)",
     )
     .bind(name)
+    .bind(project_id)
     .fetch_optional(pool)
     .await?;
 
@@ -159,18 +155,15 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         None => anyhow::bail!("Entity '{name}' not found"),
     };
 
-    // Hebbian boost on access
     boost_entity_importance(pool, entity_id).await?;
 
-    // Dual-Strength: boost retrieval + storage on access
     dual_strength::on_entity_access(pool, entity_id).await?;
 
-    // Get observations (non-superseded)
     let observations: Vec<(uuid::Uuid, String, String, f64, String)> = sqlx::query_as(
         "SELECT id, content, observation_type, importance, source
          FROM brain_observations
          WHERE entity_id = $1 AND observation_type != 'superseded'
-         ORDER BY importance DESC, created_at DESC"
+         ORDER BY importance DESC, created_at DESC",
     )
     .bind(entity_id)
     .fetch_all(pool)
@@ -189,7 +182,6 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         })
         .collect();
 
-    // Get relations
     let relations: Vec<(String, String, String, f64)> = sqlx::query_as(
         "SELECT e.name, r.relation_type,
                 CASE WHEN r.from_entity = $1 THEN 'outgoing' ELSE 'incoming' END,
@@ -198,7 +190,7 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
          JOIN brain_entities e ON (
             CASE WHEN r.from_entity = $1 THEN r.to_entity ELSE r.from_entity END = e.id
          )
-         WHERE r.from_entity = $1 OR r.to_entity = $1"
+         WHERE r.from_entity = $1 OR r.to_entity = $1",
     )
     .bind(entity_id)
     .fetch_all(pool)
@@ -216,7 +208,7 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "get",
         "entity": {
             "name": entity_name,
@@ -227,13 +219,18 @@ async fn get(pool: &PgPool, name: &str) -> Result<Value> {
         "observations": obs_json,
         "observation_count": obs_json.len(),
         "relations": rel_json
-    }))
+    });
+
+    let triggered = crate::handlers::centinela::check_triggers(pool, name, "on_access")
+        .await
+        .unwrap_or_default();
+    if !triggered.is_empty() {
+        response["triggered_reminders"] = serde_json::json!(triggered);
+    }
+
+    Ok(response)
 }
 
-/// Boost entity importance via Hebbian learning with BCM throttling.
-///
-/// Delegates to cognitive::hebbian which applies BCM metaplastic throttling
-/// (Bienenstock-Cooper-Munro 1982) to prevent winner-take-all dynamics.
 async fn boost_entity_importance(pool: &PgPool, entity_id: uuid::Uuid) -> Result<()> {
     hebbian::boost_on_access(pool, entity_id).await?;
     hebbian::boost_neighbors(pool, entity_id).await?;

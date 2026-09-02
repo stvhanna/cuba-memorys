@@ -1,8 +1,3 @@
-//! §B: PageRank with NF-IDF Hub Dampening.
-//!
-//! P1 FIX: Batch UPDATE with unnest() — 1 query instead of N individual UPDATEs.
-//! §B: NF-IDF Hub Dampening: w = strength / ln(1 + degree).
-
 use anyhow::Result;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -11,11 +6,7 @@ const DAMPING: f64 = 0.85;
 const ITERATIONS: usize = 20;
 const CONVERGENCE_THRESHOLD: f64 = 1e-6;
 
-/// Compute PageRank and store results (batch UPDATE — P1 fix).
-///
-/// Returns number of entities updated.
 pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
-    // Fetch all relations with NF-IDF hub dampening (§B)
     let edges: Vec<(uuid::Uuid, uuid::Uuid, f64)> = sqlx::query_as(
         r#"
         SELECT r.from_entity, r.to_entity,
@@ -26,7 +17,7 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
             FROM brain_relations
             GROUP BY from_entity
         ) deg ON r.from_entity = deg.from_entity
-        "#
+        "#,
     )
     .fetch_all(pool)
     .await?;
@@ -35,7 +26,6 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
         return Ok(0);
     }
 
-    // Build adjacency: node_id → (outgoing nodes with weights)
     let mut nodes: HashMap<uuid::Uuid, usize> = HashMap::new();
     let mut node_list: Vec<uuid::Uuid> = Vec::new();
 
@@ -54,7 +44,6 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
         return Ok(0);
     }
 
-    // Build adjacency lists
     let mut outgoing: Vec<Vec<(usize, f64)>> = vec![vec![]; n];
     let mut out_weight_sum: Vec<f64> = vec![0.0; n];
 
@@ -65,32 +54,33 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
         out_weight_sum[from_idx] += weight;
     }
 
-    // Power iteration
     let init_rank = 1.0 / n as f64;
     let mut ranks: Vec<f64> = vec![init_rank; n];
     let mut new_ranks: Vec<f64> = vec![0.0; n];
 
     for _iter in 0..ITERATIONS {
-        // Teleportation base
         new_ranks.fill((1.0 - DAMPING) / n as f64);
 
-        // Distribute rank through edges
+        let mut dangling_sum = 0.0;
         for i in 0..n {
             if out_weight_sum[i] > 0.0 {
                 for &(j, weight) in &outgoing[i] {
                     new_ranks[j] += DAMPING * ranks[i] * weight / out_weight_sum[i];
                 }
             } else {
-                // Dangling node: distribute equally
-                let share = DAMPING * ranks[i] / n as f64;
-                for r in new_ranks.iter_mut() {
-                    *r += share;
-                }
+                dangling_sum += DAMPING * ranks[i];
+            }
+        }
+        if dangling_sum > 0.0 {
+            let share = dangling_sum / n as f64;
+            for r in new_ranks.iter_mut() {
+                *r += share;
             }
         }
 
-        // Convergence check
-        let delta: f64 = ranks.iter().zip(new_ranks.iter())
+        let delta: f64 = ranks
+            .iter()
+            .zip(new_ranks.iter())
             .map(|(old, new)| (old - new).abs())
             .sum();
 
@@ -102,25 +92,51 @@ pub async fn compute_and_store(pool: &PgPool) -> Result<usize> {
         }
     }
 
-    // P1 FIX: Batch UPDATE with unnest() — 1 query instead of N
-    let ids: Vec<uuid::Uuid> = node_list.clone();
-    let scores: Vec<f64> = ranks;
+    let ids = node_list;
+
+    let min_r = ranks.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_r = ranks.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    if (max_r - min_r) < 1e-10 {
+        tracing::info!(
+            entities = n,
+            "PageRank blend skipped: uniform distribution (no structural differentiation signal)"
+        );
+        return Ok(n);
+    }
+
+    let range = max_r - min_r;
+    let normalized: Vec<f64> = ranks.iter().map(|r| (r - min_r) / range).collect();
 
     sqlx::query(
         r#"
         UPDATE brain_entities AS e
-        SET importance = v.rank,
+        SET importance = LEAST(0.3 * v.rank_norm + 0.7 * e.importance, 1.0),
             updated_at = NOW()
-        FROM (SELECT UNNEST($1::uuid[]) AS id, UNNEST($2::float8[]) AS rank) AS v
+        FROM (SELECT UNNEST($1::uuid[]) AS id, UNNEST($2::float8[]) AS rank_norm) AS v
         WHERE e.id = v.id
-        "#
+        "#,
     )
     .bind(&ids)
-    .bind(&scores)
+    .bind(&normalized)
     .execute(pool)
     .await?;
 
-    tracing::info!(entities = n, "PageRank updated (batch P1)");
+    sqlx::query(
+        r#"
+        INSERT INTO brain_node_metrics (node_id, pagerank_score, last_calculated)
+        SELECT UNNEST($1::uuid[]), UNNEST($2::float8[]), NOW()
+        ON CONFLICT (node_id) DO UPDATE SET
+            pagerank_score = EXCLUDED.pagerank_score,
+            last_calculated = NOW()
+        "#,
+    )
+    .bind(&ids)
+    .bind(&normalized)
+    .execute(pool)
+    .await?;
+
+    tracing::info!(entities = n, "PageRank blended (α=0.3, P1 batch)");
     Ok(n)
 }
 
@@ -130,8 +146,68 @@ mod tests {
 
     #[test]
     fn test_pagerank_convergence_constants() {
-        assert!(DAMPING > 0.0 && DAMPING < 1.0);
-        assert!(ITERATIONS > 0);
-        assert!(CONVERGENCE_THRESHOLD > 0.0);
+        const _: () = assert!(DAMPING > 0.0 && DAMPING < 1.0);
+        const _: () = assert!(ITERATIONS > 0);
+        const _: () = assert!(CONVERGENCE_THRESHOLD > 0.0);
+    }
+
+    #[test]
+    fn test_minmax_normalization() {
+        let ranks = [0.001, 0.005, 0.002, 0.010];
+        let min_r = ranks.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_r = ranks.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let range = (max_r - min_r).max(1e-12);
+        let normalized: Vec<f64> = ranks.iter().map(|r| (r - min_r) / range).collect();
+
+        assert!((normalized[0] - 0.0).abs() < 1e-6, "min should map to 0.0");
+        assert!((normalized[3] - 1.0).abs() < 1e-6, "max should map to 1.0");
+        for v in &normalized {
+            assert!(*v >= 0.0 && *v <= 1.0, "normalized value out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn test_blend_preserves_existing_importance() {
+        let existing = 0.8;
+        let rank_norm = 0.2;
+        let blended = 0.3 * rank_norm + 0.7 * existing;
+        assert!(
+            blended > 0.5,
+            "blend should preserve existing importance: got {blended}"
+        );
+        assert!(
+            blended < existing,
+            "blend should incorporate PageRank signal"
+        );
+    }
+
+    #[test]
+    fn test_uniform_ranks_trigger_early_return() {
+        let ranks = [0.25_f64; 4];
+        let min_r = ranks.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_r = ranks.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let range = max_r - min_r;
+        assert!(
+            range < 1e-10,
+            "uniform ranks must trigger early return: range={range}"
+        );
+        let existing = 0.8;
+        let decay_with_zero_norm = 0.3 * 0.0 + 0.7 * existing;
+        assert!(
+            decay_with_zero_norm < existing,
+            "without guard, importance decays from {existing} to {decay_with_zero_norm}"
+        );
+    }
+
+    #[test]
+    fn test_non_uniform_ranks_proceed_to_blend() {
+        let ranks = [0.01_f64, 0.05, 0.02, 0.10];
+        let min_r = ranks.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_r = ranks.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let range = max_r - min_r;
+        assert!(
+            range >= 1e-10,
+            "non-uniform ranks should not trigger early return: range={range}"
+        );
     }
 }

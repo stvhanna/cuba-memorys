@@ -1,3 +1,3 @@
-//! Embeddings module — ONNX BGE-small inference with spawn_blocking.
-
+pub mod backfill;
+pub mod chunk;
 pub mod onnx;

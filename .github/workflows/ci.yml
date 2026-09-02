@@ -1,0 +1,251 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check + Clippy + Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      # --all-targets lints tests/ and examples/ too; -D promotes warnings to
+      # errors. The old `-W clippy::all` only warned, and without --all-targets
+      # clippy never even compiled rust/tests/.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      # The `docs` feature ships in the release binaries, so it has to be tested like
+      # the release binaries. It was not, and cuba_docs shipped to nobody for a whole
+      # version: the published build is the DEFAULT build, and the feature was off by
+      # default. A feature CI never compiles is a feature nobody is checking.
+      - name: cargo clippy (--features docs)
+        run: cargo clippy --all-targets --features docs -- -D warnings
+
+      - name: cargo test (--features docs)
+        run: cargo test --features docs
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit
+
+      # deny.toml has existed for releases declaring the anti-GPL/AGPL policy that
+      # keeps a future dual-license option open — and nothing ever ran it, so the
+      # policy applied to none of the 433 transitive dependencies.
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --quiet
+          cargo deny check licenses bans sources
+
+      # The npm wrapper is how most people install this, and it once shipped a package
+      # whose binary was never fetched. This smoke test loads bin.js/postinstall.js and
+      # checks the fetch-on-first-use wiring without needing a network or a release —
+      # a broken require or a renamed export here breaks every `npm install`.
+      - name: npm wrapper smoke test
+        working-directory: .
+        run: node npm/install.test.js
+
+  e2e:
+    name: E2E Tests
+    needs: check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: cuba
+          POSTGRES_PASSWORD: memorys2026
+          POSTGRES_DB: brain
+        ports:
+          - 5488:5432
+        options: >-
+          --health-cmd "pg_isready -U cuba -d brain"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rust DB integration tests
+        env:
+          DATABASE_URL: postgresql://cuba:memorys2026@127.0.0.1:5488/brain
+          CUBA_PEER_DATABASE_URL: postgresql://cuba:memorys2026@127.0.0.1:5488/brain_ci_peer
+        run: |
+          # Three discovered files (v025_two_machines_converge, v027_the_bell_closes_itself,
+          # v028_two_node_convergence — nine tests) .expect() a second node and refuse to
+          # skip without one, on purpose: a two-node test that silently passes on one node
+          # proves nothing. scripts/run-all-tests.sh provisions that database; this job did
+          # not, so switching to glob discovery would have failed nine tests on every push.
+          # The lesson is general: the discovery loop was copied without the environment the
+          # local gate builds around it.
+          psql "postgresql://cuba:memorys2026@127.0.0.1:5488/postgres" -q \
+            -c "DROP DATABASE IF EXISTS brain_ci_peer WITH (FORCE)" \
+            -c "CREATE DATABASE brain_ci_peer"
+          DATABASE_URL="$CUBA_PEER_DATABASE_URL" CUBA_APP_ROLE=0 ONNX_MODEL_PATH="" \
+            cargo run --quiet --bin cuba-memorys -- doctor >/dev/null 2>&1 || true
+
+          # Every tests/*.rs is discovered, not listed by hand. The list above used to
+          # be a hand-written `--test` flag per file and had drifted to 25 of 62: files
+          # added by parallel work (v030_rem_first_delay, v030_rem_relation_batch among
+          # them) never ran here while this job kept reporting green over the commits
+          # that added them. rust/tests/ci_contract.rs is what stops this happening again.
+          #
+          # MODEL_OR_CLI_ONLY hard-assert a model or CLI this runner does not have: no
+          # ONNX embedding model (ONNX_MODEL_PATH is unset here), no NLI model, no
+          # reranker model, no `claude` on PATH. scripts/run-all-tests.sh runs them
+          # locally behind run_if_present/`command -v claude`; this job has no such
+          # environment to run them against, so it excludes them instead of failing on
+          # every push. nli_entailment/nli_cost/nli_probe self-skip via
+          # nli::available() and are NOT in this list — they run here for free and
+          # print SKIPPED without failing.
+          MODEL_OR_CLI_ONLY=(v016_chunking v016_extract_without_sampling v017_relation_scan v017_rerank_gpu)
+          # ROLE0 rewrites roles and the audit log under CUBA_APP_ROLE=0 and runs in
+          # its own step below, outside the default-role discovery loop.
+          ROLE0=(v020_audit_update_applies v020_role_separation)
+          DISCOVERED=()
+          for file in tests/*.rs; do
+            name="$(basename "$file" .rs)"
+            if printf '%s\n' "${MODEL_OR_CLI_ONLY[@]}" "${ROLE0[@]}" | grep -qx "$name"; then
+              continue
+            fi
+            DISCOVERED+=(--test "$name")
+          done
+          cargo test "${DISCOVERED[@]}" -- --ignored --nocapture
+          cargo test --lib -- --ignored --nocapture
+          CUBA_APP_ROLE=0 cargo test --test v020_audit_update_applies \
+                     --test v020_role_separation -- --ignored --nocapture
+
+      - name: Run E2E tests (25 MCP tools)
+        env:
+          DATABASE_URL: postgresql://cuba:memorys2026@127.0.0.1:5488/brain
+          CUBA_BINARY_PATH: ./target/release/cuba-memorys
+          CUBA_JUDGE: heuristic
+        run: python tests/e2e_all_tools.py
+
+  # The publish matrix builds five targets with three different feature sets, and
+  # until now nothing compiled any of them until a `v*` tag was already pushed. The
+  # v0.20.0 release found out the hard way: aarch64-linux, both macOS targets and
+  # musl all built, and x86_64-pc-windows-msvc failed in `Build (cargo)`, after the
+  # tag existed. Windows carries the largest feature set (docs,cuda,directml) and
+  # directml is compiled nowhere else, so it is the one most likely to break and the
+  # last one to find out.
+  #
+  # cargo check, not build: it catches the compile errors that broke that release
+  # without paying for codegen and linking on five runners for every push.
+  release-matrix:
+    name: Compiles as released — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: docs,cuda
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: docs
+            cross_cc: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          - os: macos-14
+            target: x86_64-apple-darwin
+            features: docs
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: docs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: docs,cuda,directml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Build scripts compile both C and C++ for the target, so `cargo check --target`
+      # needs a cross toolchain even though it never links the binary — and it needs
+      # BOTH, in separate Debian packages. Measured, one failure at a time: with
+      # neither, cc-rs cannot find `aarch64-linux-gnu-gcc`; with only gcc it gets
+      # further and then cannot find `aarch64-linux-gnu-g++`; with both, aarch64
+      # checks clean in 20s. The first version of this job shipped with only gcc and
+      # went red on aarch64 for exactly that reason, which is the failure mode this
+      # comment exists to prevent repeating: a toolchain gap wearing a compile error's
+      # clothes teaches everyone to ignore the job. macOS and Windows runners already
+      # ship a native toolchain for their own targets.
+      - name: Cross toolchain
+        if: matrix.cross_cc != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_cc }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-${{ matrix.target }}-check-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-check-
+
+      - name: cargo check (release features for this target)
+        working-directory: rust
+        run: cargo check --release --features ${{ matrix.features }} --target ${{ matrix.target }}

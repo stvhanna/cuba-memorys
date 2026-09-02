@@ -1,34 +1,12 @@
-//! V5: Prediction Error Gating — adaptive 3-threshold system.
-//!
-//! Determines how observations should be processed based on
-//! prediction error (novelty vs expectation).
-//!
-//! V5.1: Adaptive thresholds based on EMA of recent similarities.
-//! V5.2: Z-score based gating (Gemini Deep Research 2026-03-14).
-//!       Uses corpus distribution statistics (μ, σ) for mathematically
-//!       grounded thresholds instead of arbitrary mean + N*σ formulas.
-//!       Reinforce: z > 2σ above mean (top 2.3%)
-//!       Update:    z > 1σ above mean (top 15.9%)
-//!       Create:    z ≤ 1σ (bottom 84.1%)
-//!       Handles vector space anisotropy better than static thresholds.
+use crate::constants::{PRED_ERROR_REINFORCE, PRED_ERROR_UPDATE};
 
-use crate::constants::{
-    PRED_ERROR_REINFORCE,
-    PRED_ERROR_UPDATE,
-};
-
-/// Action to take based on prediction error.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GatingAction {
-    /// High similarity (>reinforce threshold): reinforce existing.
     Reinforce,
-    /// Medium similarity (>update threshold): update existing observation.
     Update,
-    /// Low similarity (<update threshold): create new observation.
     Create,
 }
 
-/// Determine action based on similarity score with static thresholds.
 pub fn gate(similarity: f64) -> GatingAction {
     if similarity >= PRED_ERROR_REINFORCE {
         GatingAction::Reinforce
@@ -39,24 +17,8 @@ pub fn gate(similarity: f64) -> GatingAction {
     }
 }
 
-/// V5.2: Z-score based adaptive gating (Gemini Deep Research 2026-03-14).
-///
-/// Uses z-score of the similarity against the recent corpus distribution:
-///   z = (similarity − μ) / σ
-///
-/// Thresholds (standard normal):
-///   z ≥ 2.0 → REINFORCE (top 2.3% — near-duplicate)
-///   z ≥ 1.0 → UPDATE    (top 15.9% — related content)
-///   z < 1.0 → CREATE    (genuinely novel)
-///
-/// This automatically handles:
-/// - High-similarity corpora (μ=0.85) → CREATE threshold rises appropriately
-/// - Diverse corpora (σ=0.2) → wider CREATE range captures more novelty
-/// - Vector space anisotropy: z-score normalizes for embedding distribution
-///
-/// Minimum 5 samples required; fallback to static thresholds.
 pub fn adaptive_gate(similarity: f64, recent_similarities: &[f64]) -> GatingAction {
-    let (reinforce_thresh, update_thresh) = adaptive_thresholds_zscore(recent_similarities);
+    let (reinforce_thresh, update_thresh) = adaptive_thresholds_conformal(recent_similarities);
 
     if similarity >= reinforce_thresh {
         GatingAction::Reinforce
@@ -67,16 +29,26 @@ pub fn adaptive_gate(similarity: f64, recent_similarities: &[f64]) -> GatingActi
     }
 }
 
-/// V5.2: Z-score based adaptive thresholds.
-///
-/// Returns (reinforce_threshold, update_threshold).
-///
-/// Formula:
-///   reinforce = clamp(μ + 2σ, 0.80, 0.98)   // z=2 → top 2.3%
-///   update    = clamp(μ + 1σ, 0.50, reinforce − 0.05)  // z=1 → top 15.9%
-///
-/// Uses population std_dev (N-based, not N-1) since we treat
-/// the recent window as the full "context population".
+pub fn adaptive_thresholds_conformal(recent_similarities: &[f64]) -> (f64, f64) {
+    if recent_similarities.len() < 5 {
+        return (PRED_ERROR_REINFORCE, PRED_ERROR_UPDATE);
+    }
+    let mut sorted: Vec<f64> = recent_similarities.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+
+    let q = |p: f64| -> f64 {
+        let idx = p * (n as f64 - 1.0);
+        let lo = idx.floor() as usize;
+        let hi = (lo + 1).min(n - 1);
+        let frac = idx - lo as f64;
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    };
+    let reinforce = q(0.977).clamp(0.80, 0.98);
+    let update = q(0.841).clamp(0.50, reinforce - 0.05);
+    (reinforce, update)
+}
+
 pub fn adaptive_thresholds_zscore(recent_similarities: &[f64]) -> (f64, f64) {
     if recent_similarities.len() < 5 {
         return (PRED_ERROR_REINFORCE, PRED_ERROR_UPDATE);
@@ -84,33 +56,19 @@ pub fn adaptive_thresholds_zscore(recent_similarities: &[f64]) -> (f64, f64) {
 
     let n = recent_similarities.len() as f64;
     let mean = recent_similarities.iter().sum::<f64>() / n;
-    let variance = recent_similarities.iter()
+    let variance = recent_similarities
+        .iter()
         .map(|x| (x - mean).powi(2))
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
     let sigma = variance.sqrt();
 
-    // V5.2: Z-score thresholds — μ + Nσ
     let reinforce = (mean + 2.0 * sigma).clamp(0.80, 0.98);
     let update = (mean + 1.0 * sigma).clamp(0.50, reinforce - 0.05);
 
     (reinforce, update)
 }
 
-/// Legacy V5.1 adaptive thresholds (kept for backward compatibility).
-pub fn adaptive_thresholds(recent_similarities: &[f64]) -> (f64, f64) {
-    adaptive_thresholds_zscore(recent_similarities)
-}
-
-/// Check if a new observation is novel enough to store.
-pub fn assess_novelty(similarity_scores: &[f64]) -> (bool, f64, GatingAction) {
-    let max_sim = similarity_scores.iter().cloned().fold(0.0f64, f64::max);
-    let action = gate(max_sim);
-
-    let should_store = !matches!(action, GatingAction::Reinforce);
-    (should_store, max_sim, action)
-}
-
-/// V5.2: Adaptive novelty assessment using z-score distribution.
 pub fn assess_novelty_adaptive(
     similarity_scores: &[f64],
     recent_similarities: &[f64],
@@ -146,25 +104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_novelty_assessment() {
-        let (store, max_sim, action) = assess_novelty(&[0.95, 0.80, 0.60]);
-        assert!(!store);
-        assert!((max_sim - 0.95).abs() < 0.001);
-        assert_eq!(action, GatingAction::Reinforce);
-
-        let (store, max_sim, action) = assess_novelty(&[0.3, 0.2, 0.1]);
-        assert!(store);
-        assert!((max_sim - 0.3).abs() < 0.001);
-        assert_eq!(action, GatingAction::Create);
-
-        let (store, _, action) = assess_novelty(&[]);
-        assert!(store);
-        assert_eq!(action, GatingAction::Create);
-    }
-
-    // ── V5.2: Z-score Tests ─────────────────────────────────────
-
-    #[test]
     fn test_zscore_insufficient_data() {
         let (r, u) = adaptive_thresholds_zscore(&[0.5, 0.6]);
         assert!((r - PRED_ERROR_REINFORCE).abs() < 0.001);
@@ -173,7 +112,6 @@ mod tests {
 
     #[test]
     fn test_zscore_high_similarity_corpus() {
-        // All recent very similar → μ high, σ small → thresholds rise
         let recent = vec![0.90, 0.88, 0.92, 0.89, 0.91, 0.90, 0.88];
         let (r, u) = adaptive_thresholds_zscore(&recent);
         assert!(r > 0.90, "high corpus → high reinforce: {r}");
@@ -182,7 +120,6 @@ mod tests {
 
     #[test]
     fn test_zscore_diverse_corpus() {
-        // Diverse observations → μ moderate, σ large → wider CREATE zone
         let recent = vec![0.1, 0.3, 0.5, 0.7, 0.9, 0.2, 0.4];
         let (r, u) = adaptive_thresholds_zscore(&recent);
         assert!(r < 0.98, "diverse → reinforce not maxed: {r}");
@@ -191,7 +128,6 @@ mod tests {
 
     #[test]
     fn test_zscore_novel_in_uniform() {
-        // Uniform high corpus → low similarity is truly novel
         let recent = vec![0.85, 0.88, 0.87, 0.86, 0.89, 0.90, 0.85];
         let action = adaptive_gate(0.5, &recent);
         assert_eq!(action, GatingAction::Create);
@@ -199,7 +135,6 @@ mod tests {
 
     #[test]
     fn test_zscore_redundant_in_uniform() {
-        // Uniform high corpus → high similarity is redundant
         let recent = vec![0.85, 0.88, 0.87, 0.86, 0.89, 0.90, 0.85];
         let action = adaptive_gate(0.95, &recent);
         assert_eq!(action, GatingAction::Reinforce);
@@ -207,7 +142,6 @@ mod tests {
 
     #[test]
     fn test_zscore_gap_maintained() {
-        // update threshold must always be < reinforce - 0.05
         for corpus in [
             vec![0.5, 0.6, 0.5, 0.7, 0.55],
             vec![0.9, 0.91, 0.88, 0.92, 0.89],
@@ -216,5 +150,50 @@ mod tests {
             let (r, u) = adaptive_thresholds_zscore(&corpus);
             assert!(r - u >= 0.05, "gap must be ≥0.05: r={r}, u={u}");
         }
+    }
+
+    #[test]
+    fn test_conformal_insufficient_data() {
+        let (r, u) = adaptive_thresholds_conformal(&[0.5, 0.6]);
+        assert!((r - PRED_ERROR_REINFORCE).abs() < 0.001);
+        assert!((u - PRED_ERROR_UPDATE).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_conformal_gap_maintained() {
+        for corpus in [
+            vec![0.5, 0.6, 0.5, 0.7, 0.55, 0.58, 0.52],
+            vec![0.9, 0.91, 0.88, 0.92, 0.89, 0.90, 0.91],
+            vec![0.1, 0.9, 0.5, 0.3, 0.7, 0.4, 0.6, 0.8, 0.2, 0.5],
+        ] {
+            let (r, u) = adaptive_thresholds_conformal(&corpus);
+            assert!(r - u >= 0.05, "gap must be ≥0.05: r={r}, u={u}");
+        }
+    }
+
+    #[test]
+    fn test_conformal_handles_skewed_right_distribution() {
+        let mut skewed: Vec<f64> = vec![0.85, 0.86, 0.87, 0.85, 0.88, 0.86, 0.87, 0.85, 0.84];
+        skewed.extend([0.20_f64, 0.30, 0.40]);
+        let (r_conf, _) = adaptive_thresholds_conformal(&skewed);
+        let (r_zscore, _) = adaptive_thresholds_zscore(&skewed);
+        assert!(
+            r_conf > r_zscore - 0.20,
+            "conformal {r_conf} should not be wildly under z-score {r_zscore}"
+        );
+    }
+
+    #[test]
+    fn test_conformal_redundant_in_uniform() {
+        let recent = vec![0.85, 0.88, 0.87, 0.86, 0.89, 0.90, 0.85, 0.87];
+        let action = adaptive_gate(0.95, &recent);
+        assert_eq!(action, GatingAction::Reinforce);
+    }
+
+    #[test]
+    fn test_conformal_novel_in_uniform() {
+        let recent = vec![0.85, 0.88, 0.87, 0.86, 0.89, 0.90, 0.85, 0.87];
+        let action = adaptive_gate(0.5, &recent);
+        assert_eq!(action, GatingAction::Create);
     }
 }
